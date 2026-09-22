@@ -5,7 +5,6 @@
  */
 
 #define DT_DRV_COMPAT zmk_input_processor_temp_layer
-
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <drivers/input_processor.h>
@@ -21,6 +20,10 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 /* Constants and Types */
 #define MAX_LAYERS ZMK_KEYMAP_LAYERS_LEN
 
+/* ここを追加 */
+#define CONTINUOUS_MS 100
+#define MAX_GAP_MS 50
+
 struct temp_layer_config {
     int16_t require_prior_idle_ms;
     const uint16_t *excluded_positions;
@@ -31,6 +34,10 @@ struct temp_layer_state {
     uint8_t toggle_layer;
     bool is_active;
     int64_t last_tapped_timestamp;
+
+    /* ここを追加 */
+    int64_t continuous_start_timestamp;
+    int64_t last_input_timestamp;
 };
 
 struct temp_layer_data {
@@ -69,7 +76,6 @@ static void update_layer_state(struct temp_layer_state *state, bool activate) {
     if (state->is_active == activate) {
         return;
     }
-
     state->is_active = activate;
     if (activate) {
         zmk_keymap_layer_activate(state->toggle_layer, false);
@@ -84,7 +90,6 @@ struct layer_state_action {
     uint8_t layer;
     bool activate;
 };
-
 K_MSGQ_DEFINE(temp_layer_action_msgq, sizeof(struct layer_state_action),
               CONFIG_ZMK_INPUT_PROCESSOR_TEMP_LAYER_MAX_ACTION_EVENTS, 4);
 
@@ -98,7 +103,6 @@ static void layer_action_work_cb(struct k_work *work) {
         LOG_ERR("Error locking for updating %d", ret);
         return;
     }
-
     struct layer_state_action action;
 
     while (k_msgq_get(&temp_layer_action_msgq, &action, K_MSEC(10)) >= 0) {
@@ -137,13 +141,17 @@ static int handle_layer_state_changed(const struct device *dev, const zmk_event_
     if (!zmk_keymap_layer_active(zmk_keymap_layer_index_to_id(data->state.toggle_layer))) {
         LOG_DBG("Deactivating layer that was activated by this processor");
         data->state.is_active = false;
+
+        /* ここを追加 */
+        data->state.continuous_start_timestamp = 0;
+        data->state.last_input_timestamp = 0;
+
         k_work_cancel_delayable(&layer_disable_works[data->state.toggle_layer]);
     }
     ret = k_mutex_unlock(&data->lock);
     if (ret < 0) {
         return ret;
     }
-
     return ZMK_EV_EVENT_BUBBLE;
 }
 
@@ -160,7 +168,6 @@ static int handle_position_state_changed(const struct device *dev, const zmk_eve
     }
 
     const struct temp_layer_config *cfg = dev->config;
-
     if (data->state.is_active && cfg->excluded_positions && cfg->num_positions > 0) {
         if (!position_is_excluded(cfg, ev->position)) {
             LOG_DBG("Position not excluded, deactivating layer");
@@ -186,7 +193,6 @@ static int handle_keycode_state_changed(const struct device *dev, const zmk_even
     if (ret < 0) {
         return ret;
     }
-
     LOG_DBG("Setting last_tapped_timestamp to: %lld", ev->timestamp);
     data->state.last_tapped_timestamp = ev->timestamp;
 
@@ -209,7 +215,6 @@ static int handle_state_changed_dispatcher(const struct device *dev, const zmk_e
         LOG_DBG("Dispatching handle_keycode_state_changed");
         return handle_keycode_state_changed(dev, eh);
     }
-
     return ZMK_EV_EVENT_BUBBLE;
 }
 
@@ -236,6 +241,17 @@ static int temp_layer_handle_event(const struct device *dev, struct input_event 
         return -EINVAL;
     }
 
+    /* ここを追加
+     *
+     * トラックボール等のREL X/Yだけを
+     * 連続入力判定の対象にする。
+     */
+    if (event->type != INPUT_EV_REL ||
+        (event->code != INPUT_REL_X &&
+         event->code != INPUT_REL_Y)) {
+        return ZMK_INPUT_PROC_CONTINUE;
+    }
+
     struct temp_layer_data *data = (struct temp_layer_data *)dev->data;
 
     int ret = k_mutex_lock(&data->lock, K_FOREVER);
@@ -247,15 +263,65 @@ static int temp_layer_handle_event(const struct device *dev, struct input_event 
 
     data->state.toggle_layer = param1;
 
-    if (!data->state.is_active &&
-        !should_quick_tap(cfg, data->state.last_tapped_timestamp, k_uptime_get())) {
-        struct layer_state_action action = {.layer = param1, .activate = true};
+    /* ここを変更 */
+    int64_t now = k_uptime_get();
 
-        int ret = k_msgq_put(&temp_layer_action_msgq, &action, K_MSEC(10));
-        if (ret < 0) {
-            LOG_ERR("Failed to enqueue action to enable layer %d (%d)", param1, ret);
+    if (!data->state.is_active &&
+        !should_quick_tap(cfg, data->state.last_tapped_timestamp, now)) {
+
+        if (data->state.last_input_timestamp == 0) {
+
+            /* 最初のRELイベント */
+            data->state.continuous_start_timestamp = now;
+            data->state.last_input_timestamp = now;
+
         } else {
-            k_work_submit(&layer_action_work);
+
+            int64_t gap =
+                now - data->state.last_input_timestamp;
+
+            if (gap > MAX_GAP_MS) {
+
+                /* 一度止まったので、ここから再スタート */
+                data->state.continuous_start_timestamp = now;
+                data->state.last_input_timestamp = now;
+
+            } else {
+
+                /* 連続入力中 */
+                data->state.last_input_timestamp = now;
+
+                if ((now - data->state.continuous_start_timestamp)
+                    >= CONTINUOUS_MS) {
+
+                    struct layer_state_action action = {
+                        .layer = param1,
+                        .activate = true
+                    };
+
+                    ret = k_msgq_put(
+                        &temp_layer_action_msgq,
+                        &action,
+                        K_MSEC(10)
+                    );
+
+                    if (ret < 0) {
+                        LOG_ERR(
+                            "Failed to enqueue action to enable layer %d (%d)",
+                            param1,
+                            ret
+                        );
+                    } else {
+                        k_work_submit(&layer_action_work);
+
+                        /*
+                         * 連続入力判定は一度成立したら
+                         * このシーケンスを終了。
+                         */
+                        data->state.continuous_start_timestamp = 0;
+                    }
+                }
+            }
         }
     }
 
@@ -271,6 +337,10 @@ static int temp_layer_handle_event(const struct device *dev, struct input_event 
 static int temp_layer_init(const struct device *dev) {
     struct temp_layer_data *data = (struct temp_layer_data *)dev->data;
     k_mutex_init(&data->lock);
+
+    /* ここを追加 */
+    data->state.continuous_start_timestamp = 0;
+    data->state.last_input_timestamp = 0;
 
     for (int i = 0; i < MAX_LAYERS; i++) {
         k_work_init_delayable(&layer_disable_works[i], layer_disable_callback);
