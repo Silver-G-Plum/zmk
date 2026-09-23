@@ -14,6 +14,7 @@
 #include <zmk/events/position_state_changed.h>
 #include <zmk/events/keycode_state_changed.h>
 #include <zmk/events/layer_state_changed.h>
+#include <zephyr/input/input-event-codes.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -246,11 +247,84 @@ static int temp_layer_handle_event(const struct device *dev, struct input_event 
      * トラックボール等のREL X/Yだけを
      * 連続入力判定の対象にする。
      */
-    if (event->type != INPUT_EV_REL ||
-        (event->code != INPUT_REL_X &&
-         event->code != INPUT_REL_Y)) {
-        return ZMK_INPUT_PROC_CONTINUE;
+/* Mouse button input: activate while held, deactivate on release */
+if (event->type == INPUT_EV_KEY &&
+    (event->code == INPUT_BTN_0 ||
+     event->code == INPUT_BTN_1 ||
+     event->code == INPUT_BTN_2)) {
+
+    struct temp_layer_data *data =
+        (struct temp_layer_data *)dev->data;
+
+    int ret = k_mutex_lock(&data->lock, K_FOREVER);
+    if (ret < 0) {
+        return ret;
     }
+
+    data->state.toggle_layer = param1;
+
+    if (event->value) {
+        /* Mouse button pressed */
+        if (!data->state.is_active) {
+            struct layer_state_action action = {
+                .layer = param1,
+                .activate = true
+            };
+
+            ret = k_msgq_put(
+                &temp_layer_action_msgq,
+                &action,
+                K_MSEC(10)
+            );
+
+            if (ret < 0) {
+                LOG_ERR(
+                    "Failed to enqueue action to enable layer %d (%d)",
+                    param1,
+                    ret
+                );
+            } else {
+                k_work_submit(&layer_action_work);
+            }
+        }
+    } else {
+        /* Mouse button released */
+        if (data->state.is_active) {
+            struct layer_state_action action = {
+                .layer = param1,
+                .activate = false
+            };
+
+            ret = k_msgq_put(
+                &temp_layer_action_msgq,
+                &action,
+                K_MSEC(10)
+            );
+
+            if (ret < 0) {
+                LOG_ERR(
+                    "Failed to enqueue action to disable layer %d (%d)",
+                    param1,
+                    ret
+                );
+            } else {
+                k_work_submit(&layer_action_work);
+            }
+        }
+    }
+
+    k_mutex_unlock(&data->lock);
+
+    return ZMK_INPUT_PROC_CONTINUE;
+}
+
+/* Continuous REL X/Y input */
+if (event->type != INPUT_EV_REL ||
+    (event->code != INPUT_REL_X &&
+     event->code != INPUT_REL_Y)) {
+    return ZMK_INPUT_PROC_CONTINUE;
+}
+    
 
     struct temp_layer_data *data = (struct temp_layer_data *)dev->data;
 
