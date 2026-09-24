@@ -7,6 +7,7 @@
 #define DT_DRV_COMPAT zmk_input_processor_temp_layer
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/input/input.h>
 #include <drivers/input_processor.h>
 #include <zephyr/logging/log.h>
 #include <zmk/keymap.h>
@@ -23,6 +24,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 /* ここを追加 */
 #define CONTINUOUS_MS 100
 #define MAX_GAP_MS 50
+#define MOUSE_HOLD_OFF_MS 500
 
 struct temp_layer_config {
     int16_t require_prior_idle_ms;
@@ -48,6 +50,8 @@ struct temp_layer_data {
 
 /* Static Work Queue Items */
 static struct k_work_delayable layer_disable_works[MAX_LAYERS];
+
+static struct k_work_delayable mouse_hold_off_work;
 
 /* Position Search */
 static bool position_is_excluded(const struct temp_layer_config *config, uint32_t position) {
@@ -129,6 +133,32 @@ static void layer_disable_callback(struct k_work *work) {
 
     int ret = k_msgq_put(&temp_layer_action_msgq, &action, K_MSEC(10));
     k_work_submit(&layer_action_work);
+}
+
+static void mouse_hold_off_callback(struct k_work *work) {
+    const struct device *dev = DEVICE_DT_INST_GET(0);
+    struct temp_layer_data *data = (struct temp_layer_data *)dev->data;
+
+    int ret = k_mutex_lock(&data->lock, K_FOREVER);
+    if (ret < 0) {
+        return;
+    }
+
+    if (data->state.is_active) {
+        struct layer_state_action action = {
+            .layer = data->state.toggle_layer,
+            .activate = false
+        };
+
+        ret = k_msgq_put(&temp_layer_action_msgq, &action, K_MSEC(10));
+        if (ret < 0) {
+            LOG_ERR("Failed to enqueue mouse hold-off action (%d)", ret);
+        } else {
+            k_work_submit(&layer_action_work);
+        }
+    }
+
+    k_mutex_unlock(&data->lock);
 }
 
 /* Event Handlers */
@@ -243,8 +273,65 @@ static int temp_layer_handle_event(const struct device *dev, struct input_event 
 
     /* ここを追加
      *
-     * トラックボール等のREL X/Yだけを
-     * 連続入力判定の対象にする。
+    /*
+     * マウスボタン：
+     *   押下    → AML ON
+     *   長押し  → AML OFF
+     *   離す    → 何もしない
+     */
+    if (event->type == INPUT_EV_KEY &&
+        (event->code == INPUT_BTN_0 ||
+         event->code == INPUT_BTN_1 ||
+         event->code == INPUT_BTN_2)) {
+
+        struct temp_layer_data *data = (struct temp_layer_data *)dev->data;
+
+        int ret = k_mutex_lock(&data->lock, K_FOREVER);
+        if (ret < 0) {
+            return ret;
+        }
+
+        data->state.toggle_layer = param1;
+
+        if (event->value) {
+            /* マウスボタン押下 → AML ON */
+            struct layer_state_action action = {
+                .layer = param1,
+                .activate = true
+            };
+
+            ret = k_msgq_put(&temp_layer_action_msgq,
+                             &action,
+                             K_MSEC(10));
+
+            if (ret < 0) {
+                LOG_ERR("Failed to enqueue mouse button action (%d)", ret);
+            } else {
+                k_work_submit(&layer_action_work);
+            }
+
+            /*
+             * 長押し判定開始
+             */
+            k_work_reschedule(&mouse_hold_off_work,
+                              K_MSEC(MOUSE_HOLD_OFF_MS));
+
+        } else {
+            /*
+             * ボタンを離しただけではAMLをOFFしない。
+             * 500ms未満なら長押し判定をキャンセル。
+             */
+            k_work_cancel_delayable(&mouse_hold_off_work);
+        }
+
+        k_mutex_unlock(&data->lock);
+
+        return ZMK_INPUT_PROC_CONTINUE;
+    }
+
+    /*
+     * マウスボタン以外：
+     * REL X/Yだけを連続入力判定の対象にする。
      */
     if (event->type != INPUT_EV_REL ||
         (event->code != INPUT_REL_X &&
@@ -325,7 +412,11 @@ static int temp_layer_handle_event(const struct device *dev, struct input_event 
         }
     }
 
-    if (param2 > 0) {
+    if (param2 > 0 &&
+        !(event->type == INPUT_EV_KEY &&
+          (event->code == INPUT_BTN_0 ||
+           event->code == INPUT_BTN_1 ||
+           event->code == INPUT_BTN_2))) {
         k_work_reschedule(&layer_disable_works[param1], K_MSEC(param2));
     }
 
@@ -341,6 +432,8 @@ static int temp_layer_init(const struct device *dev) {
     /* ここを追加 */
     data->state.continuous_start_timestamp = 0;
     data->state.last_input_timestamp = 0;
+
+    k_work_init_delayable(&mouse_hold_off_work, mouse_hold_off_callback);
 
     for (int i = 0; i < MAX_LAYERS; i++) {
         k_work_init_delayable(&layer_disable_works[i], layer_disable_callback);
