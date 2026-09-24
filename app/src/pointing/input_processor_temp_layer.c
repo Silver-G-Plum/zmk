@@ -24,7 +24,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 /* ここを追加 */
 #define CONTINUOUS_MS 100
 #define MAX_GAP_MS 50
-#define MOUSE_HOLD_OFF_MS 500
+#define MOUSE_HOLD_OFF_MS 100
 
 struct temp_layer_config {
     int16_t require_prior_idle_ms;
